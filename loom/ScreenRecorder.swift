@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import CoreImage
 import AppKit
 
 // MARK: - RecordingSession (disposable — one per recording, fully isolated)
@@ -25,7 +26,25 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
     private var firstSampleTime: CMTime = .invalid
     private var lastSampleBuffer: CMSampleBuffer?
 
-    init(display: SCDisplay, mic: AVCaptureDevice?, outputURL: URL) throws {
+    // -- Zoom on Click --
+    private let zoomEnabled: Bool
+    private let displayID: CGDirectDisplayID
+    private let displayScale: CGFloat
+    private var zoomClickTime: CFAbsoluteTime = 0
+    private var clickMonitor: Any?
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var zoomPool: CVPixelBufferPool?
+
+    private let zoomFactor: CGFloat = 2.0
+    private let zoomInTime: Double = 0.25
+    private let zoomHoldTime: Double = 0.6
+    private let zoomOutTime: Double = 0.3
+
+    init(display: SCDisplay, mic: AVCaptureDevice?, outputURL: URL, zoomOnClick: Bool) throws {
+        self.zoomEnabled = zoomOnClick
+        self.displayID = display.displayID
+        self.displayScale = NSScreen.main?.backingScaleFactor ?? 2
+
         // -- Writer --
         let w = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
         w.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 1)
@@ -61,7 +80,7 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
             let output = AVCaptureAudioDataOutput()
             if session.canAddOutput(output) { session.addOutput(output) }
 
-            let recommended = output.recommendedAudioSettingsForAssetWriter(writingTo: .mov) as? [String: Any]
+            let recommended = output.recommendedAudioSettingsForAssetWriter(writingTo: .mov)
             let audioSettings = recommended ?? [AVFormatIDKey: kAudioFormatMPEG4AAC]
 
             let audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
@@ -100,7 +119,15 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.micSession?.startRunning()
         }
-        print("[FreeLum] Capture started")
+        if zoomEnabled {
+            clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.zoomClickTime = CFAbsoluteTimeGetCurrent()
+                self.lock.unlock()
+            }
+        }
+        print("[FreeLum] Capture started (zoom: \(zoomEnabled))")
     }
 
     func setPaused(_ p: Bool) {
@@ -110,6 +137,12 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
     }
 
     func stop() async {
+        // 0. Remove click monitor
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
+
         // 1. Stop sources first so no new callbacks fire
         try? await stream.stopCapture()
         micSession?.stopRunning()
@@ -188,6 +221,96 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
         print("[FreeLum] Stream error: \(error.localizedDescription)")
     }
 
+    // MARK: - Zoom Helpers
+
+    private func currentZoom() -> CGFloat {
+        guard zoomEnabled, zoomClickTime > 0 else { return 1.0 }
+        let elapsed = CFAbsoluteTimeGetCurrent() - zoomClickTime
+        if elapsed < zoomInTime {
+            return 1.0 + (zoomFactor - 1.0) * smoothstep(elapsed / zoomInTime)
+        } else if elapsed < zoomInTime + zoomHoldTime {
+            return zoomFactor
+        } else if elapsed < zoomInTime + zoomHoldTime + zoomOutTime {
+            let t = (elapsed - zoomInTime - zoomHoldTime) / zoomOutTime
+            return zoomFactor - (zoomFactor - 1.0) * smoothstep(t)
+        }
+        return 1.0
+    }
+
+    private func smoothstep(_ x: Double) -> Double {
+        let t = max(0.0, min(1.0, x))
+        return t * t * (3.0 - 2.0 * t)
+    }
+
+    private func applyZoom(to pixelBuffer: CVPixelBuffer, zoom: CGFloat, timing: CMSampleTimingInfo) -> CMSampleBuffer? {
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        let fw = CGFloat(w), fh = CGFloat(h)
+
+        // Get cursor in CG coordinates (top-left origin)
+        guard let cursorPos = CGEvent(source: nil)?.location else { return nil }
+        let displayBounds = CGDisplayBounds(displayID)
+
+        // Local pixel coordinates (top-left origin)
+        let localX = (cursorPos.x - displayBounds.origin.x) * displayScale
+        let localY = (cursorPos.y - displayBounds.origin.y) * displayScale
+
+        // Crop dimensions
+        let cropW = fw / zoom
+        let cropH = fh / zoom
+
+        // Center on cursor, clamped to frame
+        let cropX = max(0, min(localX - cropW / 2, fw - cropW))
+        let cropY = max(0, min(localY - cropH / 2, fh - cropH))
+
+        // CIImage uses bottom-left origin — flip Y
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let ciCropY = fh - cropY - cropH
+        let cropRect = CGRect(x: cropX, y: ciCropY, width: cropW, height: cropH)
+
+        let zoomed = ciImage
+            .cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
+            .transformed(by: CGAffineTransform(scaleX: zoom, y: zoom))
+
+        // Get pixel buffer from pool
+        if zoomPool == nil {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: w,
+                kCVPixelBufferHeightKey as String: h,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &zoomPool)
+        }
+        var outBuffer: CVPixelBuffer?
+        guard let pool = zoomPool,
+              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outBuffer) == kCVReturnSuccess,
+              let output = outBuffer else { return nil }
+
+        ciContext.render(zoomed, to: output)
+
+        // Wrap in CMSampleBuffer
+        var formatDesc: CMFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: output,
+            formatDescriptionOut: &formatDesc
+        )
+        guard let fmt = formatDesc else { return nil }
+
+        var timingCopy = timing
+        var newSB: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: output,
+            formatDescription: fmt,
+            sampleTiming: &timingCopy,
+            sampleBufferOut: &newSB
+        )
+        return newSB
+    }
+
     // MARK: - Writing
 
     private func writeVideo(_ sb: CMSampleBuffer) {
@@ -213,10 +336,25 @@ private final class RecordingSession: NSObject, @unchecked Sendable,
             CMSampleTimingInfo(duration: sb.duration, presentationTimeStamp: adjusted, decodeTimeStamp: .invalid)
         ]) else { return }
 
-        lastSampleBuffer = retimed
+        // Apply click-to-zoom
+        let zoom = currentZoom()
+        let finalBuffer: CMSampleBuffer
+        if zoom > 1.01,
+           let pixelBuffer = CMSampleBufferGetImageBuffer(retimed),
+           let zoomed = applyZoom(to: pixelBuffer, zoom: zoom,
+                                  timing: CMSampleTimingInfo(duration: sb.duration,
+                                                             presentationTimeStamp: adjusted,
+                                                             decodeTimeStamp: .invalid))
+        {
+            finalBuffer = zoomed
+        } else {
+            finalBuffer = retimed
+        }
+
+        lastSampleBuffer = finalBuffer
 
         if videoInput.isReadyForMoreMediaData {
-            if !videoInput.append(retimed) {
+            if !videoInput.append(finalBuffer) {
                 print("[FreeLum] VIDEO APPEND FAIL: \(writer.error?.localizedDescription ?? "?")")
             }
         }
@@ -259,6 +397,7 @@ final class ScreenRecorder: @unchecked Sendable {
     var selectedMicrophone: AVCaptureDevice?
     var errorMessage: String?
     var savedURL: URL?
+    var zoomOnClick = true
 
     // Completely isolated session — created fresh, destroyed fully
     @ObservationIgnored private var session: RecordingSession?
@@ -273,7 +412,7 @@ final class ScreenRecorder: @unchecked Sendable {
             availableDisplays = content.displays
             if selectedDisplay == nil { selectedDisplay = content.displays.first }
         } catch {
-            errorMessage = "Screen recording permission required.\nSystem Settings → Privacy & Security → Screen Recording."
+            errorMessage = "Screen recording permission required.\nSystem Settings \u{2192} Privacy & Security \u{2192} Screen Recording."
         }
 
         let discovery = AVCaptureDevice.DiscoverySession(
@@ -307,7 +446,8 @@ final class ScreenRecorder: @unchecked Sendable {
         try? FileManager.default.removeItem(at: outputURL)
 
         do {
-            let s = try RecordingSession(display: display, mic: selectedMicrophone, outputURL: outputURL)
+            let s = try RecordingSession(display: display, mic: selectedMicrophone,
+                                         outputURL: outputURL, zoomOnClick: zoomOnClick)
             session = s
             savedURL = outputURL
 

@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var selectedMicID: String = ""
 
     @State private var cameraShape: CameraShape = .circle
+    @State private var zoomOnClick = true
 
     @State private var countdownValue: Int = 0
     @State private var countdownWindow: NSWindow?
@@ -72,6 +73,23 @@ struct ContentView: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 10)
             }
+
+            Divider()
+
+            Button {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                HStack {
+                    Text("Quit FreeLum")
+                    Spacer()
+                    Text("\u{2318}Q")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
         .frame(width: 320)
         .background(.regularMaterial)
@@ -196,6 +214,16 @@ struct ContentView: View {
                         shapeButton(.pill)
                         Spacer()
                     }
+                }
+            }
+
+            // Zoom on Click
+            card {
+                settingRow("plus.magnifyingglass", "Zoom on Click") {
+                    Toggle("", isOn: $zoomOnClick)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                        .controlSize(.small)
                 }
             }
 
@@ -456,6 +484,7 @@ struct ContentView: View {
             }
             countdownValue = 0
             hideCountdownOverlay()
+            recorder.zoomOnClick = zoomOnClick
             await recorder.startRecording()
         }
     }
